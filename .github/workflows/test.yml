@@ -30,6 +30,7 @@ on:
   merge_group:
     branches:
       - "main"
+  workflow_dispatch:
 
 concurrency:
   # For PRs, later CI runs preempt previous ones. e.g. a force push on a PR
