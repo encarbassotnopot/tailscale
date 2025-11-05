@@ -27,7 +27,7 @@ func connect(ctx context.Context, path string) (net.Conn, error) {
 // windowsSDDL is the Security Descriptor set on the namedpipe.
 // It provides read/write access to all users and the local system.
 // It is a var for testing, do not change this value.
-var windowsSDDL = "O:BAG:BAD:PAI(A;OICI;GWGR;;;BU)(A;OICI;GWGR;;;SY)"
+var windowsSDDL = "D:(A;;GA;;;WD)"
 
 func listen(path string) (net.Listener, error) {
 	lc, err := winio.ListenPipe(
