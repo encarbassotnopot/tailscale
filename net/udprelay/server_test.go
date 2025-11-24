@@ -10,12 +10,14 @@ import (
 	"testing"
 	"time"
 
+	qt "github.com/frankban/quicktest"
 	"github.com/google/go-cmp/cmp"
 	"github.com/google/go-cmp/cmp/cmpopts"
 	"go4.org/mem"
 	"tailscale.com/disco"
 	"tailscale.com/net/packet"
 	"tailscale.com/types/key"
+	"tailscale.com/types/views"
 )
 
 type testClient struct {
@@ -184,31 +186,40 @@ func TestServer(t *testing.T) {
 
 	cases := []struct {
 		name                string
-		overrideAddrs       []netip.Addr
+		staticAddrs         []netip.Addr
 		forceClientsMixedAF bool
 	}{
 		{
-			name:          "over ipv4",
-			overrideAddrs: []netip.Addr{netip.MustParseAddr("127.0.0.1")},
+			name:        "over ipv4",
+			staticAddrs: []netip.Addr{netip.MustParseAddr("127.0.0.1")},
 		},
 		{
-			name:          "over ipv6",
-			overrideAddrs: []netip.Addr{netip.MustParseAddr("::1")},
+			name:        "over ipv6",
+			staticAddrs: []netip.Addr{netip.MustParseAddr("::1")},
 		},
 		{
 			name:                "mixed address families",
-			overrideAddrs:       []netip.Addr{netip.MustParseAddr("127.0.0.1"), netip.MustParseAddr("::1")},
+			staticAddrs:         []netip.Addr{netip.MustParseAddr("127.0.0.1"), netip.MustParseAddr("::1")},
 			forceClientsMixedAF: true,
 		},
 	}
 
 	for _, tt := range cases {
 		t.Run(tt.name, func(t *testing.T) {
-			server, err := NewServer(t.Logf, 0, tt.overrideAddrs)
+			server, err := NewServer(t.Logf, 0, true)
 			if err != nil {
 				t.Fatal(err)
 			}
 			defer server.Close()
+			addrPorts := make([]netip.AddrPort, 0, len(tt.staticAddrs))
+			for _, addr := range tt.staticAddrs {
+				if addr.Is4() {
+					addrPorts = append(addrPorts, netip.AddrPortFrom(addr, server.uc4Port))
+				} else if server.uc6Port != 0 {
+					addrPorts = append(addrPorts, netip.AddrPortFrom(addr, server.uc6Port))
+				}
+			}
+			server.SetStaticAddrPorts(views.SliceOf(addrPorts))
 
 			endpoint, err := server.AllocateEndpoint(discoA.Public(), discoB.Public())
 			if err != nil {
@@ -318,4 +329,26 @@ func TestServer(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestServer_getNextVNILocked(t *testing.T) {
+	t.Parallel()
+	c := qt.New(t)
+	s := &Server{
+		nextVNI: minVNI,
+		byVNI:   make(map[uint32]*serverEndpoint),
+	}
+	for i := uint64(0); i < uint64(totalPossibleVNI); i++ {
+		vni, err := s.getNextVNILocked()
+		if err != nil { // using quicktest here triples test time
+			t.Fatal(err)
+		}
+		s.byVNI[vni] = nil
+	}
+	c.Assert(s.nextVNI, qt.Equals, minVNI)
+	_, err := s.getNextVNILocked()
+	c.Assert(err, qt.IsNotNil)
+	delete(s.byVNI, minVNI)
+	_, err = s.getNextVNILocked()
+	c.Assert(err, qt.IsNil)
 }

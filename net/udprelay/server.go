@@ -21,7 +21,6 @@ import (
 
 	"go4.org/mem"
 	"golang.org/x/net/ipv6"
-	"tailscale.com/client/local"
 	"tailscale.com/disco"
 	"tailscale.com/net/batching"
 	"tailscale.com/net/netaddr"
@@ -32,10 +31,12 @@ import (
 	"tailscale.com/net/stun"
 	"tailscale.com/net/udprelay/endpoint"
 	"tailscale.com/net/udprelay/status"
+	"tailscale.com/tailcfg"
 	"tailscale.com/tstime"
 	"tailscale.com/types/key"
 	"tailscale.com/types/logger"
 	"tailscale.com/types/nettype"
+	"tailscale.com/types/views"
 	"tailscale.com/util/eventbus"
 	"tailscale.com/util/set"
 )
@@ -72,15 +73,23 @@ type Server struct {
 	closeCh             chan struct{}
 	netChecker          *netcheck.Client
 
-	mu                sync.Mutex       // guards the following fields
-	addrDiscoveryOnce bool             // addrDiscovery completed once (successfully or unsuccessfully)
-	addrPorts         []netip.AddrPort // the ip:port pairs returned as candidate endpoints
-	closed            bool
-	lamportID         uint64
-	vniPool           []uint32 // the pool of available VNIs
-	byVNI             map[uint32]*serverEndpoint
-	byDisco           map[key.SortedPairOfDiscoPublic]*serverEndpoint
+	mu                  sync.Mutex // guards the following fields
+	derpMap             *tailcfg.DERPMap
+	onlyStaticAddrPorts bool                        // no dynamic addr port discovery when set
+	staticAddrPorts     views.Slice[netip.AddrPort] // static ip:port pairs set with [Server.SetStaticAddrPorts]
+	dynamicAddrPorts    []netip.AddrPort            // dynamically discovered ip:port pairs
+	closed              bool
+	lamportID           uint64
+	nextVNI             uint32
+	byVNI               map[uint32]*serverEndpoint
+	byDisco             map[key.SortedPairOfDiscoPublic]*serverEndpoint
 }
+
+const (
+	minVNI           = uint32(1)
+	maxVNI           = uint32(1<<24 - 1)
+	totalPossibleVNI = maxVNI - minVNI + 1
+)
 
 // serverEndpoint contains Server-internal [endpoint.ServerEndpoint] state.
 // serverEndpoint methods are not thread-safe.
@@ -271,25 +280,22 @@ func (e *serverEndpoint) isBound() bool {
 
 // NewServer constructs a [Server] listening on port. If port is zero, then
 // port selection is left up to the host networking stack. If
-// len(overrideAddrs) > 0 these will be used in place of dynamic discovery,
-// which is useful to override in tests.
-func NewServer(logf logger.Logf, port int, overrideAddrs []netip.Addr) (s *Server, err error) {
+// onlyStaticAddrPorts is true, then dynamic addr:port discovery will be
+// disabled, and only addr:port's set via [Server.SetStaticAddrPorts] will be
+// used.
+func NewServer(logf logger.Logf, port int, onlyStaticAddrPorts bool) (s *Server, err error) {
 	s = &Server{
 		logf:                logf,
 		disco:               key.NewDisco(),
 		bindLifetime:        defaultBindLifetime,
 		steadyStateLifetime: defaultSteadyStateLifetime,
 		closeCh:             make(chan struct{}),
+		onlyStaticAddrPorts: onlyStaticAddrPorts,
 		byDisco:             make(map[key.SortedPairOfDiscoPublic]*serverEndpoint),
+		nextVNI:             minVNI,
 		byVNI:               make(map[uint32]*serverEndpoint),
 	}
 	s.discoPublic = s.disco.Public()
-	// TODO: instead of allocating 10s of MBs for the full pool, allocate
-	// smaller chunks and increase as needed
-	s.vniPool = make([]uint32, 0, 1<<24-1)
-	for i := 1; i < 1<<24; i++ {
-		s.vniPool = append(s.vniPool, uint32(i))
-	}
 
 	// TODO(creachadair): Find a way to plumb this in during initialization.
 	// As-written, messages published here will not be seen by other components
@@ -319,19 +325,7 @@ func NewServer(logf logger.Logf, port int, overrideAddrs []netip.Addr) (s *Serve
 		return nil, err
 	}
 
-	if len(overrideAddrs) > 0 {
-		addrPorts := make(set.Set[netip.AddrPort], len(overrideAddrs))
-		for _, addr := range overrideAddrs {
-			if addr.IsValid() {
-				if addr.Is4() {
-					addrPorts.Add(netip.AddrPortFrom(addr, s.uc4Port))
-				} else if s.uc6 != nil {
-					addrPorts.Add(netip.AddrPortFrom(addr, s.uc6Port))
-				}
-			}
-		}
-		s.addrPorts = addrPorts.Slice()
-	} else {
+	if !s.onlyStaticAddrPorts {
 		s.wg.Add(1)
 		go s.addrDiscoveryLoop()
 	}
@@ -373,15 +367,12 @@ func (s *Server) addrDiscoveryLoop() {
 			}
 		}
 
-		// fetch DERPMap to feed to netcheck
-		derpMapCtx, derpMapCancel := context.WithTimeout(context.Background(), time.Second)
-		defer derpMapCancel()
-		localClient := &local.Client{}
-		// TODO(jwhited): We are in-process so use eventbus or similar.
-		//  local.Client gets us going.
-		dm, err := localClient.CurrentDERPMap(derpMapCtx)
-		if err != nil {
-			return nil, err
+		dm := s.getDERPMap()
+		if dm == nil {
+			// We don't have a DERPMap which is required to dynamically
+			// discover external addresses, but we can return the endpoints we
+			// do have.
+			return addrPorts.Slice(), nil
 		}
 
 		// get addrPorts as visible from DERP
@@ -393,14 +384,29 @@ func (s *Server) addrDiscoveryLoop() {
 		if err != nil {
 			return nil, err
 		}
-		if rep.GlobalV4.IsValid() {
-			addrPorts.Add(rep.GlobalV4)
+		// Add STUN-discovered endpoints with their observed ports.
+		v4Addrs, v6Addrs := rep.GetGlobalAddrs()
+		for _, addr := range v4Addrs {
+			if addr.IsValid() {
+				addrPorts.Add(addr)
+			}
 		}
-		if rep.GlobalV6.IsValid() {
-			addrPorts.Add(rep.GlobalV6)
+		for _, addr := range v6Addrs {
+			if addr.IsValid() {
+				addrPorts.Add(addr)
+			}
 		}
-		// TODO(jwhited): consider logging if rep.MappingVariesByDestIP as
-		//  that's a hint we are not well-positioned to operate as a UDP relay.
+
+		if len(v4Addrs) >= 1 && v4Addrs[0].IsValid() {
+			// If they're behind a hard NAT and are using a fixed
+			// port locally, assume they might've added a static
+			// port mapping on their router to the same explicit
+			// port that the relay is running with. Worst case
+			// it's an invalid candidate mapping.
+			if rep.MappingVariesByDestIP.EqualBool(true) && s.uc4Port != 0 {
+				addrPorts.Add(netip.AddrPortFrom(v4Addrs[0].Addr(), s.uc4Port))
+			}
+		}
 		return addrPorts.Slice(), nil
 	}
 
@@ -415,8 +421,7 @@ func (s *Server) addrDiscoveryLoop() {
 				s.logf("error discovering IP:port candidates: %v", err)
 			}
 			s.mu.Lock()
-			s.addrPorts = addrPorts
-			s.addrDiscoveryOnce = true
+			s.dynamicAddrPorts = addrPorts
 			s.mu.Unlock()
 		case <-s.closeCh:
 			return
@@ -557,7 +562,6 @@ func (s *Server) Close() error {
 		defer s.mu.Unlock()
 		clear(s.byVNI)
 		clear(s.byDisco)
-		s.vniPool = nil
 		s.closed = true
 		s.bus.Close()
 	})
@@ -579,7 +583,6 @@ func (s *Server) endpointGCLoop() {
 			if v.isExpired(now, s.bindLifetime, s.steadyStateLifetime) {
 				delete(s.byDisco, k)
 				delete(s.byVNI, v.vni)
-				s.vniPool = append(s.vniPool, v.vni)
 			}
 		}
 	}
@@ -714,6 +717,36 @@ func (e ErrServerNotReady) Error() string {
 	return fmt.Sprintf("server not ready, retry after %v", e.RetryAfter)
 }
 
+// getNextVNILocked returns the next available VNI. It implements the
+// "Traditional BSD Port Selection Algorithm" from RFC6056. This algorithm does
+// not attempt to obfuscate the selection, i.e. the selection is predictable.
+// For now, we favor simplicity and reducing VNI re-use over more complex
+// ephemeral port (VNI) selection algorithms.
+func (s *Server) getNextVNILocked() (uint32, error) {
+	for i := uint32(0); i < totalPossibleVNI; i++ {
+		vni := s.nextVNI
+		if vni == maxVNI {
+			s.nextVNI = minVNI
+		} else {
+			s.nextVNI++
+		}
+		_, ok := s.byVNI[vni]
+		if !ok {
+			return vni, nil
+		}
+	}
+	return 0, errors.New("VNI pool exhausted")
+}
+
+// getAllAddrPortsCopyLocked returns a copy of the combined
+// [Server.staticAddrPorts] and [Server.dynamicAddrPorts] slices.
+func (s *Server) getAllAddrPortsCopyLocked() []netip.AddrPort {
+	addrPorts := make([]netip.AddrPort, 0, len(s.dynamicAddrPorts)+s.staticAddrPorts.Len())
+	addrPorts = append(addrPorts, s.staticAddrPorts.AsSlice()...)
+	addrPorts = append(addrPorts, slices.Clone(s.dynamicAddrPorts)...)
+	return addrPorts
+}
+
 // AllocateEndpoint allocates an [endpoint.ServerEndpoint] for the provided pair
 // of [key.DiscoPublic]'s. If an allocation already exists for discoA and discoB
 // it is returned without modification/reallocation. AllocateEndpoint returns
@@ -727,11 +760,8 @@ func (s *Server) AllocateEndpoint(discoA, discoB key.DiscoPublic) (endpoint.Serv
 		return endpoint.ServerEndpoint{}, ErrServerClosed
 	}
 
-	if len(s.addrPorts) == 0 {
-		if !s.addrDiscoveryOnce {
-			return endpoint.ServerEndpoint{}, ErrServerNotReady{RetryAfter: endpoint.ServerRetryAfter}
-		}
-		return endpoint.ServerEndpoint{}, errors.New("server addrPorts are not yet known")
+	if s.staticAddrPorts.Len() == 0 && len(s.dynamicAddrPorts) == 0 {
+		return endpoint.ServerEndpoint{}, ErrServerNotReady{RetryAfter: endpoint.ServerRetryAfter}
 	}
 
 	if discoA.Compare(s.discoPublic) == 0 || discoB.Compare(s.discoPublic) == 0 {
@@ -754,7 +784,7 @@ func (s *Server) AllocateEndpoint(discoA, discoB key.DiscoPublic) (endpoint.Serv
 			// consider storing them (maybe interning) in the [*serverEndpoint]
 			// at allocation time.
 			ClientDisco:         pair.Get(),
-			AddrPorts:           slices.Clone(s.addrPorts),
+			AddrPorts:           s.getAllAddrPortsCopyLocked(),
 			VNI:                 e.vni,
 			LamportID:           e.lamportID,
 			BindLifetime:        tstime.GoDuration{Duration: s.bindLifetime},
@@ -762,8 +792,9 @@ func (s *Server) AllocateEndpoint(discoA, discoB key.DiscoPublic) (endpoint.Serv
 		}, nil
 	}
 
-	if len(s.vniPool) == 0 {
-		return endpoint.ServerEndpoint{}, errors.New("VNI pool exhausted")
+	vni, err := s.getNextVNILocked()
+	if err != nil {
+		return endpoint.ServerEndpoint{}, err
 	}
 
 	s.lamportID++
@@ -771,10 +802,10 @@ func (s *Server) AllocateEndpoint(discoA, discoB key.DiscoPublic) (endpoint.Serv
 		discoPubKeys: pair,
 		lamportID:    s.lamportID,
 		allocatedAt:  time.Now(),
+		vni:          vni,
 	}
 	e.discoSharedSecrets[0] = s.disco.Shared(e.discoPubKeys.Get()[0])
 	e.discoSharedSecrets[1] = s.disco.Shared(e.discoPubKeys.Get()[1])
-	e.vni, s.vniPool = s.vniPool[0], s.vniPool[1:]
 
 	s.byDisco[pair] = e
 	s.byVNI[e.vni] = e
@@ -783,7 +814,7 @@ func (s *Server) AllocateEndpoint(discoA, discoB key.DiscoPublic) (endpoint.Serv
 	return endpoint.ServerEndpoint{
 		ServerDisco:         s.discoPublic,
 		ClientDisco:         pair.Get(),
-		AddrPorts:           slices.Clone(s.addrPorts),
+		AddrPorts:           s.getAllAddrPortsCopyLocked(),
 		VNI:                 e.vni,
 		LamportID:           e.lamportID,
 		BindLifetime:        tstime.GoDuration{Duration: s.bindLifetime},
@@ -827,4 +858,32 @@ func (s *Server) GetSessions() []status.ServerSession {
 		})
 	}
 	return sessions
+}
+
+// SetDERPMapView sets the [tailcfg.DERPMapView] to use for future netcheck
+// reports.
+func (s *Server) SetDERPMapView(view tailcfg.DERPMapView) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if !view.Valid() {
+		s.derpMap = nil
+		return
+	}
+	s.derpMap = view.AsStruct()
+}
+
+func (s *Server) getDERPMap() *tailcfg.DERPMap {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.derpMap
+}
+
+// SetStaticAddrPorts sets addr:port pairs the [Server] will advertise
+// as candidates it is potentially reachable over, in combination with
+// dynamically discovered pairs. This replaces any previously-provided static
+// values.
+func (s *Server) SetStaticAddrPorts(addrPorts views.Slice[netip.AddrPort]) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.staticAddrPorts = addrPorts
 }

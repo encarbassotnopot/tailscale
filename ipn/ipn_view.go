@@ -363,6 +363,12 @@ func (v PrefsView) AdvertiseServices() views.Slice[string] {
 	return views.SliceOf(v.ж.AdvertiseServices)
 }
 
+// Sync is whether this node should sync its configuration from
+// the control plane. If unset, this defaults to true.
+// This exists primarily for testing, to verify that netmap caching
+// and offline operation work correctly.
+func (v PrefsView) Sync() opt.Bool { return v.ж.Sync }
+
 // NoSNAT specifies whether to source NAT traffic going to
 // destinations in AdvertiseRoutes. The default is to apply source
 // NAT, which makes the traffic appear to come from the router
@@ -444,7 +450,7 @@ func (v PrefsView) RelayServerPort() views.ValuePointer[int] {
 
 // AllowSingleHosts was a legacy field that was always true
 // for the past 4.5 years. It controlled whether Tailscale
-// peers got /32 or /127 routes for each other.
+// peers got /32 or /128 routes for each other.
 // As of 2024-05-17 we're starting to ignore it, but to let
 // people still downgrade Tailscale versions and not break
 // all peer-to-peer networking we still write it to disk (as JSON)
@@ -482,6 +488,7 @@ var _PrefsViewNeedsRegeneration = Prefs(struct {
 	Egg                    bool
 	AdvertiseRoutes        []netip.Prefix
 	AdvertiseServices      []string
+	Sync                   opt.Bool
 	NoSNAT                 bool
 	NoStatefulFiltering    opt.Bool
 	NetfilterMode          preftype.NetfilterMode
@@ -807,12 +814,19 @@ func (v TCPPortHandlerView) TCPForward() string { return v.ж.TCPForward }
 // (the HTTPS mode uses ServeConfig.Web)
 func (v TCPPortHandlerView) TerminateTLS() string { return v.ж.TerminateTLS }
 
+// ProxyProtocol indicates whether to send a PROXY protocol header
+// before forwarding the connection to TCPForward.
+//
+// This is only valid if TCPForward is non-empty.
+func (v TCPPortHandlerView) ProxyProtocol() int { return v.ж.ProxyProtocol }
+
 // A compilation failure here means this code must be regenerated, with the command at the top of this file.
 var _TCPPortHandlerViewNeedsRegeneration = TCPPortHandler(struct {
-	HTTPS        bool
-	HTTP         bool
-	TCPForward   string
-	TerminateTLS string
+	HTTPS         bool
+	HTTP          bool
+	TCPForward    string
+	TerminateTLS  string
+	ProxyProtocol int
 }{})
 
 // View returns a read-only view of HTTPHandler.
